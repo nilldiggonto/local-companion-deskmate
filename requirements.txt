@@ -2,3 +2,6 @@ fastapi
 uvicorn[standard]
 httpx
 PyQt6
+pynput
+pywinauto
+pyautogui
