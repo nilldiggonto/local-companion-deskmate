@@ -1,5 +1,5 @@
 from PyQt6.QtCore import QPoint, Qt, pyqtSignal
-from PyQt6.QtGui import QBrush, QColor, QMouseEvent, QPaintEvent, QPainter
+from PyQt6.QtGui import QBrush, QColor, QMouseEvent, QMoveEvent, QPaintEvent, QPainter
 from PyQt6.QtWidgets import QWidget
 
 CLICK_MOVEMENT_THRESHOLD_PX = 4
@@ -7,6 +7,7 @@ CLICK_MOVEMENT_THRESHOLD_PX = 4
 
 class AvatarWindow(QWidget):
     clicked = pyqtSignal()
+    moved = pyqtSignal()
 
     def __init__(self):
         super().__init__()
@@ -38,8 +39,12 @@ class AvatarWindow(QWidget):
 
     def mouseReleaseEvent(self, event: QMouseEvent) -> None:
         if self._press_global_pos is not None:
-            moved = event.globalPosition().toPoint() - self._press_global_pos
-            if abs(moved.x()) < CLICK_MOVEMENT_THRESHOLD_PX and abs(moved.y()) < CLICK_MOVEMENT_THRESHOLD_PX:
+            moved_by = event.globalPosition().toPoint() - self._press_global_pos
+            if abs(moved_by.x()) < CLICK_MOVEMENT_THRESHOLD_PX and abs(moved_by.y()) < CLICK_MOVEMENT_THRESHOLD_PX:
                 self.clicked.emit()
         self._drag_offset = None
         self._press_global_pos = None
+
+    def moveEvent(self, event: QMoveEvent) -> None:
+        super().moveEvent(event)
+        self.moved.emit()

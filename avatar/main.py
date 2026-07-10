@@ -20,12 +20,25 @@ def main():
     bubble = ChatBubble()
     active_workers = []
 
+    def position_bubble():
+        bubble.move(avatar.x() + avatar.width(), avatar.y())
+
+    def open_chat():
+        position_bubble()
+        bubble.show()
+
+    def hide_chat():
+        bubble.hide()
+
     def toggle_bubble():
         if bubble.isVisible():
-            bubble.hide()
+            hide_chat()
         else:
-            bubble.move(avatar.x() + avatar.width(), avatar.y())
-            bubble.show()
+            open_chat()
+
+    def follow_avatar():
+        if bubble.isVisible():
+            position_bubble()
 
     def handle_message(text: str):
         bubble.input_field.setEnabled(False)
@@ -46,9 +59,10 @@ def main():
         worker.start()
 
     avatar.clicked.connect(toggle_bubble)
+    avatar.moved.connect(follow_avatar)
     bubble.message_submitted.connect(handle_message)
 
-    tray = AvatarTrayIcon(avatar)
+    tray = AvatarTrayIcon(avatar, open_chat, hide_chat)
     tray.show()
 
     avatar.show()

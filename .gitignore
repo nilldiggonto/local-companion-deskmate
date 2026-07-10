@@ -1,5 +1,6 @@
 selfbotEnv/
 plan.md
+wrap.md
 data/*.db
 __pycache__/
 *.pyc

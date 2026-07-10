@@ -16,19 +16,29 @@ def _make_icon() -> QIcon:
 
 
 class AvatarTrayIcon(QSystemTrayIcon):
-    def __init__(self, avatar: QWidget, parent=None):
+    def __init__(self, avatar: QWidget, open_chat, hide_chat, parent=None):
         super().__init__(_make_icon(), parent)
         self.setToolTip("Self-Learning Avatar")
 
         menu = QMenu()
 
-        show_action = QAction("Show", menu)
+        show_action = QAction("Show Avatar", menu)
         show_action.triggered.connect(avatar.show)
         menu.addAction(show_action)
 
-        hide_action = QAction("Hide", menu)
+        hide_action = QAction("Hide Avatar", menu)
         hide_action.triggered.connect(avatar.hide)
         menu.addAction(hide_action)
+
+        menu.addSeparator()
+
+        open_chat_action = QAction("Open Chat", menu)
+        open_chat_action.triggered.connect(open_chat)
+        menu.addAction(open_chat_action)
+
+        hide_chat_action = QAction("Hide Chat", menu)
+        hide_chat_action.triggered.connect(hide_chat)
+        menu.addAction(hide_chat_action)
 
         menu.addSeparator()
 
