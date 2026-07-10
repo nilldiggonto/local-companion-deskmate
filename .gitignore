@@ -1,0 +1,5 @@
+selfbotEnv/
+plan.md
+data/*.db
+__pycache__/
+*.pyc
