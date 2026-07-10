@@ -5,10 +5,16 @@ from PyQt6.QtWidgets import QApplication
 from avatar.avatar_window import AvatarWindow
 from avatar.chat_bubble import ChatBubble
 from avatar.chat_worker import ChatWorker
+from avatar.server_launcher import start_server
+from avatar.tray import AvatarTrayIcon
 
 
 def main():
     app = QApplication(sys.argv)
+    app.setQuitOnLastWindowClosed(False)
+
+    server_process = start_server()
+    app.aboutToQuit.connect(server_process.terminate)
 
     avatar = AvatarWindow()
     bubble = ChatBubble()
@@ -41,6 +47,9 @@ def main():
 
     avatar.clicked.connect(toggle_bubble)
     bubble.message_submitted.connect(handle_message)
+
+    tray = AvatarTrayIcon(avatar)
+    tray.show()
 
     avatar.show()
     sys.exit(app.exec())
