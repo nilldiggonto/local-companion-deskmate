@@ -65,8 +65,7 @@ def _play_key(step: dict) -> None:
 
 def _check_window(title_contains: str) -> bool:
     try:
-        windows = Desktop(backend="uia").windows()
-        return any(title_contains.lower() in (w.window_text() or "").lower() for w in windows)
+        return desktop_tools.find_open_target(title_contains) is not None
     except Exception:
         return False
 

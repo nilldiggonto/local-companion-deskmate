@@ -8,7 +8,7 @@ def _make_icon() -> QIcon:
     pixmap.fill(Qt.GlobalColor.transparent)
     painter = QPainter(pixmap)
     painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-    painter.setBrush(QColor("#4A90D9"))
+    painter.setBrush(QColor("#00e5ff"))
     painter.setPen(Qt.PenStyle.NoPen)
     painter.drawEllipse(2, 2, 28, 28)
     painter.end()

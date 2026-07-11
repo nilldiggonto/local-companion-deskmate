@@ -106,6 +106,33 @@ def wait(seconds: float) -> None:
     time.sleep(min(float(seconds), MAX_WAIT_SECONDS))
 
 
+BROWSER_HINTS = ("chrome", "edge", "firefox", "brave", "opera")
+
+
+def find_open_target(text: str) -> str | None:
+    """Looks for `text` in window titles first, then inside browser windows'
+    tab strips. Returns a human-readable description of where it was found,
+    or None. (Note: a browser window's title only shows the ACTIVE tab, so
+    the tab scan is what catches background tabs -- when the browser exposes
+    them, which isn't guaranteed.)"""
+    windows = Desktop(backend="uia").windows()
+    for w in windows:
+        title = w.window_text() or ""
+        if text.lower() in title.lower():
+            return f"a window titled '{title}'"
+    for w in windows:
+        title = (w.window_text() or "").lower()
+        if any(hint in title for hint in BROWSER_HINTS):
+            try:
+                for tab in w.descendants(control_type="TabItem"):
+                    name = tab.window_text() or ""
+                    if text.lower() in name.lower():
+                        return f"the browser tab '{name}'"
+            except Exception:
+                continue
+    return None
+
+
 # ---------- internal ----------
 
 def _find_window(title_contains: str):

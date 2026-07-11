@@ -2,13 +2,19 @@ import asyncio
 import re
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI
+import httpx
+from fastapi import FastAPI, Request
+from fastapi.responses import JSONResponse
+from pynput.mouse import Controller as MouseController
 
+from recorder import desktop_tools
 from recorder.input_recorder import InputRecorder
+from recorder.ui_inspector import get_element_at
 from recorder.player import describe_step, play_macro, report_problems
 from server.agent import AgentSession, run_agent
 from server.llm_client import chat
 from server.macros import (
+    clear_all_macros,
     delete_macro,
     get_macro,
     list_macros,
@@ -67,6 +73,29 @@ _last_macro: str | None = None
 _last_details: str | None = None
 _pending_macro_confirm: str | None = None
 _last_combo: list[str] | None = None
+_last_agent_actions: list[dict] | None = None
+_look_pending: bool = False
+_last_looked: dict | None = None
+_pending_forget_all: bool = False
+
+# undo/redo for macro changes: (name, previous_steps or None if it was new)
+_undo_stack: list[tuple[str, list | None]] = []
+_redo_stack: list[tuple[str, list | None]] = []
+
+# messages matching these are commands -- they always win over a pending
+# agent question (so the agent can never swallow 'details' or 'watch this')
+COMMAND_PATTERNS = (
+    r"^details$", r"^what happened\??$", r"^steps$", r"^show (?:steps|macro) ",
+    r"^watch", r"^done\b", r"^cancel (?:recording|task)$",
+    r"^(?:fix|replace) step ", r"^(?:drop|remove) step ", r"^(?:add|insert) before step ",
+    r"^forget macro ", r"^relearn ", r"^combine as ", r"^use macro ", r"^check if ",
+    r"^undo$", r"^redo$", r"^save skill as ", r"^look$", r"^learn click",
+    r"^list macros$", r"^skills$", r"^what do you know\??$",
+    r"^forget all macros$", r"^is .+ open(?:ed)?\??$", r"^help$",
+)
+
+# these commands mean the user is taking over -- drop any confused agent task
+TAKEOVER_PATTERN = r"^(?:watch|relearn |forget macro |undo$|redo$)"
 
 
 @asynccontextmanager
@@ -81,6 +110,26 @@ app = FastAPI(lifespan=lifespan)
 @app.get("/health")
 async def health() -> dict:
     return {"status": "ok"}
+
+
+@app.exception_handler(httpx.HTTPError)
+async def ollama_error_handler(request: Request, exc: httpx.HTTPError):
+    """When Ollama is down or crashed, answer in plain language instead of a
+    raw 500. (Returned as a normal chat reply so every client shows it.)"""
+    print(f"[ollama error] {exc}")
+    return JSONResponse(
+        status_code=200,
+        content=ChatResponse(
+            reply=(
+                "My brain (Ollama) isn't answering right now. Usually this means it "
+                "crashed or isn't running.\n"
+                "1. Quit Ollama fully (tray icon -> Quit, or end 'ollama.exe' in Task Manager)\n"
+                "2. Start it again\n"
+                "3. Test it: run 'ollama run qwen2.5 \"hi\"' in a terminal\n"
+                "Then talk to me again!"
+            )
+        ).model_dump(),
+    )
 
 
 def _strip_trailing_submit_steps(steps: list[dict], submitted_text: str) -> list[dict]:
@@ -112,7 +161,7 @@ def _format_trail(trail: list[str]) -> str:
 
 
 def _agent_result_to_reply(result: dict, task: str) -> ChatResponse:
-    global _agent_session, _last_macro, _last_details
+    global _agent_session, _last_details, _last_agent_actions
 
     _last_details = _format_trail(result.get("trail", []))
 
@@ -126,11 +175,13 @@ def _agent_result_to_reply(result: dict, task: str) -> ChatResponse:
         actions = result["actions"]
         suggestions = ["details"]
         if actions:
-            skill_name = task[:60].strip().rstrip(".?!")
-            save_macro(skill_name, actions, description=task)
-            _last_macro = skill_name
-            reply += f"\n\nI learned this as '{skill_name}' -- next time I'll just do it."
-            suggestions = ["details", "steps"]
+            _last_agent_actions = actions
+            auto_name = task[:40].strip().rstrip(".?!")
+            reply += (
+                "\n\nDid that actually do what you wanted? If yes, I can remember it "
+                "as a skill. If not, just tell me what went wrong."
+            )
+            suggestions = [f"save skill as {auto_name}", "details"]
         return ChatResponse(reply=reply, suggestions=suggestions)
 
     return ChatResponse(
@@ -155,6 +206,25 @@ def _find_macro_name(requested: str) -> str | None:
         (m["name"] for m in list_macros() if m["name"].lower() == requested.lower().strip()),
         None,
     )
+
+
+def _is_command(message: str) -> bool:
+    lower = message.lower().strip()
+    return any(re.match(p, lower) for p in COMMAND_PATTERNS)
+
+
+def _save_macro_tracked(name: str, steps: list[dict], description: str | None = None) -> None:
+    """save_macro plus an undo record of what was there before."""
+    _undo_stack.append((name, get_macro(name)))
+    _redo_stack.clear()
+    save_macro(name, steps, description=description)
+
+
+def _steps_preview(steps: list[dict], limit: int = 6) -> str:
+    lines = [f"{i + 1}. {describe_step(s)}" for i, s in enumerate(steps[:limit])]
+    if len(steps) > limit:
+        lines.append(f"...and {len(steps) - limit} more")
+    return "\n".join(lines)
 
 
 def _parse_step_spec(spec: str) -> tuple[dict | None, str]:
@@ -207,10 +277,10 @@ def _do_remove_step(name: str, n: int) -> ChatResponse:
     if not 1 <= n <= len(steps):
         return ChatResponse(reply=f"'{name}' has {len(steps)} steps -- there is no step {n}.")
     removed = steps.pop(n - 1)
-    save_macro(name, steps, description=name)
+    _save_macro_tracked(name, steps, description=name)
     return ChatResponse(
         reply=f"Okay, dropped step {n} ({describe_step(removed)}). '{name}' now has {len(steps)} steps.",
-        suggestions=["steps"],
+        suggestions=["steps", "undo"],
     )
 
 
@@ -223,10 +293,10 @@ def _do_replace_step(name: str, n: int, spec: str) -> ChatResponse:
         return ChatResponse(reply=error)
     old_desc = describe_step(steps[n - 1])
     steps[n - 1] = new_step
-    save_macro(name, steps, description=name)
+    _save_macro_tracked(name, steps, description=name)
     return ChatResponse(
         reply=f"Learned! Step {n} is now '{describe_step(new_step)}' (was: {old_desc}).",
-        suggestions=["steps"],
+        suggestions=["steps", "undo"],
     )
 
 
@@ -236,6 +306,11 @@ async def _run_macro_response(macro_name: str) -> ChatResponse:
 
     steps = get_macro(macro_name)
     _last_macro = macro_name
+    if not steps:
+        return ChatResponse(
+            reply=f"'{macro_name}' is an empty skill -- it has no steps, so it does nothing. Best to forget it.",
+            suggestions=[f"forget macro {macro_name}"],
+        )
     try:
         report = await asyncio.to_thread(play_macro, steps)
     except Exception as exc:
@@ -323,10 +398,10 @@ def _do_insert_step(name: str, n: int, spec: str) -> ChatResponse:
     if new_step is None:
         return ChatResponse(reply=error)
     steps.insert(n - 1, new_step)
-    save_macro(name, steps, description=name)
+    _save_macro_tracked(name, steps, description=name)
     return ChatResponse(
         reply=f"Learned! Added '{describe_step(new_step)}' as step {n}. '{name}' now has {len(steps)} steps.",
-        suggestions=["steps"],
+        suggestions=["steps", "undo"],
     )
 
 
@@ -334,6 +409,7 @@ def _do_insert_step(name: str, n: int, spec: str) -> ChatResponse:
 async def chat_endpoint(request: ChatRequest) -> ChatResponse:
     global _active_recorder, _pending_steps, _relearn_target_name, _agent_session
     global _last_macro, _last_details, _pending_macro_confirm, _last_combo
+    global _last_agent_actions, _look_pending, _last_looked, _pending_forget_all
 
     message = request.message.strip()
 
@@ -343,9 +419,173 @@ async def chat_endpoint(request: ChatRequest) -> ChatResponse:
         return ChatResponse(reply=f"Okay, dropped the task '{task}'.")
 
     if _agent_session is not None and _agent_session.pending_question is not None:
-        task = _agent_session.task
-        result = await run_agent(_agent_session, user_answer=message)
-        return _agent_result_to_reply(result, task)
+        if _is_command(message):
+            # commands always win -- and teaching commands take over entirely
+            if re.match(TAKEOVER_PATTERN, message.lower()):
+                _agent_session = None
+        else:
+            task = _agent_session.task
+            result = await run_agent(_agent_session, user_answer=message)
+            return _agent_result_to_reply(result, task)
+
+    if message.lower() == "undo":
+        if not _undo_stack:
+            return ChatResponse(reply="Nothing to undo.")
+        name, previous = _undo_stack.pop()
+        _redo_stack.append((name, get_macro(name)))
+        if previous is None:
+            delete_macro(name)
+            return ChatResponse(reply=f"Undone -- I forgot '{name}' (it was newly learned).")
+        save_macro(name, previous, description=name)
+        return ChatResponse(reply=f"Undone -- '{name}' is back to how it was before.", suggestions=["steps"])
+
+    if message.lower() == "redo":
+        if not _redo_stack:
+            return ChatResponse(reply="Nothing to redo.")
+        name, redo_steps = _redo_stack.pop()
+        _undo_stack.append((name, get_macro(name)))
+        if redo_steps is None:
+            delete_macro(name)
+            return ChatResponse(reply=f"Redone -- '{name}' is forgotten again.")
+        save_macro(name, redo_steps, description=name)
+        return ChatResponse(reply=f"Redone -- '{name}' has the newer version again.", suggestions=["steps"])
+
+    if _pending_forget_all:
+        _pending_forget_all = False
+        if message.lower() in YES_WORDS or message.lower() == "yes, forget everything":
+            clear_all_macros()
+            _undo_stack.clear()
+            _redo_stack.clear()
+            _last_macro = None
+            _last_combo = None
+            return ChatResponse(
+                reply="Clean slate! I've forgotten every skill. Teach me fresh with 'watch this' or 'look'.",
+                suggestions=["watch this", "look", "help"],
+            )
+        # not a yes -- fall through and treat as a normal message
+
+    if message.lower() == "forget all macros":
+        macros = list_macros()
+        if not macros:
+            return ChatResponse(reply="I don't know any skills yet -- nothing to forget!")
+        _pending_forget_all = True
+        return ChatResponse(
+            reply=f"This will erase ALL {len(macros)} skills I've learned, permanently. Are you sure?",
+            suggestions=["yes, forget everything", "no"],
+        )
+
+    if message.lower() in ("list macros", "skills", "what do you know", "what do you know?"):
+        macros = list_macros()
+        if not macros:
+            return ChatResponse(
+                reply="I don't know any skills yet. Teach me with 'watch this' or 'look'!",
+                suggestions=["watch this", "look", "help"],
+            )
+        lines = []
+        for m in macros:
+            steps = get_macro(m["name"]) or []
+            record = ""
+            if m["success_count"] or m["fail_count"]:
+                record = f" ({m['success_count']} wins/{m['fail_count']} fails)"
+            lines.append(f"- {m['name']} [{len(steps)} steps]{record}")
+        return ChatResponse(
+            reply=f"I know {len(macros)} skill(s):\n" + "\n".join(lines),
+            suggestions=["forget all macros"],
+        )
+
+    is_open_match = re.match(r"^is (?P<t>.+?) (?:open|opened)\??$", message, re.IGNORECASE)
+    if is_open_match:
+        target = is_open_match.group("t").strip()
+        found = await asyncio.to_thread(desktop_tools.find_open_target, target)
+        if found:
+            return ChatResponse(reply=f"Yes -- I can see {found}.")
+        return ChatResponse(
+            reply=(
+                f"I don't see '{target}' anywhere. I checked all window titles and browser tabs. "
+                "Heads up: browsers only show me the ACTIVE tab's name in the window title, and "
+                "background tabs only when the browser exposes them -- so I can miss things."
+            ),
+            suggestions=["look"],
+        )
+
+    if message.lower() == "help":
+        return ChatResponse(
+            reply=(
+                "Here's how you teach me:\n"
+                "- 'watch this' -> show me ONE small action -> 'done, call this <name>'\n"
+                "- 'look' -> hover something -> 'now' -> 'learn click it'\n"
+                "- '<skill> then <skill>' runs skills in a chain; 'combine as <name>' saves the chain\n"
+                "- 'list macros' / 'steps' / 'details' to see what I know and did\n"
+                "- 'fix step N with ...', 'drop step N', 'relearn <name>', 'undo'\n"
+                "- 'is <thing> open?' -- I'll check windows and browser tabs\n"
+                "- 'forget macro <name>' / 'forget all macros' to reset me"
+            )
+        )
+
+    save_skill_match = re.match(r"^save skill as (?P<name>.+)$", message, re.IGNORECASE)
+    if save_skill_match:
+        if not _last_agent_actions:
+            return ChatResponse(reply="There's no recent successful task to save.")
+        skill_name = save_skill_match.group("name").strip()
+        _save_macro_tracked(skill_name, _last_agent_actions, description=skill_name)
+        saved = _last_agent_actions
+        _last_agent_actions = None
+        _last_macro = skill_name
+        return ChatResponse(
+            reply=f"Remembered '{skill_name}'!\n" + _steps_preview(saved),
+            suggestions=["steps", "undo"],
+        )
+
+    if message.lower() == "look":
+        _look_pending = True
+        return ChatResponse(
+            reply=(
+                "Hover your mouse over the thing you want to teach me about and KEEP it "
+                "there. Then type 'now' and press Enter (keyboard only -- don't move the mouse!)."
+            )
+        )
+
+    if _look_pending and message.lower() == "now":
+        _look_pending = False
+        x, y = MouseController().position
+        try:
+            element = get_element_at(int(x), int(y))
+        except Exception:
+            element = None
+        if not element or not (element.get("name") or element.get("automation_id")):
+            return ChatResponse(
+                reply=f"I looked at ({int(x)}, {int(y)}) but couldn't identify anything there -- that app may not expose its elements. Try another spot."
+            )
+        _last_looked = {"element": element, "x": int(x), "y": int(y)}
+        label = element.get("name") or element.get("automation_id")
+        return ChatResponse(
+            reply=(
+                f"I see '{label}' ({element.get('control_type', 'element')}) at ({int(x)}, {int(y)}).\n"
+                "Want me to learn to click it?"
+            ),
+            suggestions=["learn click it", "look"],
+        )
+
+    if message.lower() in ("learn click it", "learn to click it"):
+        if _last_looked is None:
+            return ChatResponse(reply="I haven't looked at anything yet -- say 'look' first.")
+        element = _last_looked["element"]
+        label = element.get("name") or element.get("automation_id") or "element"
+        skill_name = f"click {label}"[:60]
+        step = {
+            "action": "click",
+            "x": _last_looked["x"],
+            "y": _last_looked["y"],
+            "button": "Button.left",
+            "target": element,
+        }
+        _save_macro_tracked(skill_name, [step], description=skill_name)
+        _last_macro = skill_name
+        _last_looked = None
+        return ChatResponse(
+            reply=f"Learned '{skill_name}'! Chain it any time, e.g. '{skill_name} then ...'.",
+            suggestions=["steps", "undo"],
+        )
 
     if _pending_macro_confirm is not None:
         confirm_name = _pending_macro_confirm
@@ -360,11 +600,11 @@ async def chat_endpoint(request: ChatRequest) -> ChatResponse:
             return ChatResponse(reply="There's no recent chain to combine -- run a few skills together first, like 'open chrome then new tab'.")
         combo_name = combine_match.group("name").strip()
         combo_steps = [{"action": "run_macro", "name": n} for n in _last_combo]
-        save_macro(combo_name, combo_steps, description=combo_name)
+        _save_macro_tracked(combo_name, combo_steps, description=combo_name)
         _last_macro = combo_name
         return ChatResponse(
             reply=f"Nice -- '{combo_name}' now means: " + " -> ".join(_last_combo) + ". One skill built from smaller ones!",
-            suggestions=["steps"],
+            suggestions=["steps", "undo"],
         )
 
     if message.lower().startswith(FORGET_PREFIX):
@@ -498,23 +738,33 @@ async def chat_endpoint(request: ChatRequest) -> ChatResponse:
         _active_recorder = None
         steps = _strip_trailing_submit_steps(steps, message)
 
+        if not steps:
+            _relearn_target_name = None
+            return ChatResponse(
+                reply="I didn't see you do anything, so there's nothing to save. Say 'watch this' to try again.",
+                suggestions=["watch this"],
+            )
+
         if _relearn_target_name is not None:
             macro_name = _relearn_target_name
             _relearn_target_name = None
-            save_macro(macro_name, steps, description=macro_name)
+            _save_macro_tracked(macro_name, steps, description=macro_name)
             _last_macro = macro_name
             return ChatResponse(
-                reply=f"Got it -- I re-learned '{macro_name}' ({len(steps)} steps).",
-                suggestions=["steps"],
+                reply=f"Got it -- I re-learned '{macro_name}':\n" + _steps_preview(steps),
+                suggestions=["steps", "undo"],
             )
 
         macro_name = _extract_macro_name(message)
         if not macro_name:
             _pending_steps = steps
             return ChatResponse(
-                reply=f"Stopped recording ({len(steps)} steps). What should I call it?"
+                reply=(
+                    f"Stopped recording. Here's what I saw:\n{_steps_preview(steps)}"
+                    "\n\nWhat should I call it?"
+                )
             )
-        save_macro(macro_name, steps, description=macro_name)
+        _save_macro_tracked(macro_name, steps, description=macro_name)
         _last_macro = macro_name
         tip = ""
         if len(steps) > 5:
@@ -524,28 +774,28 @@ async def chat_endpoint(request: ChatRequest) -> ChatResponse:
                 "'open chrome then new tab'."
             )
         return ChatResponse(
-            reply=f"Learned '{macro_name}' ({len(steps)} steps)!{tip}",
-            suggestions=["steps"],
+            reply=f"Learned '{macro_name}':\n" + _steps_preview(steps) + tip,
+            suggestions=["steps", "undo"],
         )
 
     if _pending_steps is not None:
         macro_name = _strip_name_fillers(message)
         if not macro_name:
             return ChatResponse(reply="I still need a name for that recording.")
-        save_macro(macro_name, _pending_steps, description=macro_name)
-        saved_count = len(_pending_steps)
+        _save_macro_tracked(macro_name, _pending_steps, description=macro_name)
+        saved_steps = _pending_steps
         _pending_steps = None
         _last_macro = macro_name
         tip = ""
-        if saved_count > 5:
+        if len(saved_steps) > 5:
             tip = (
                 "\n\nTip: that's quite a few steps for one skill. Tiny skills combine "
                 "better -- next time teach one small action, then chain them like "
                 "'open chrome then new tab'."
             )
         return ChatResponse(
-            reply=f"Learned '{macro_name}' ({saved_count} steps)!{tip}",
-            suggestions=["steps"],
+            reply=f"Learned '{macro_name}':\n" + _steps_preview(saved_steps) + tip,
+            suggestions=["steps", "undo"],
         )
 
     # never let macro matching hijack a message where the user is

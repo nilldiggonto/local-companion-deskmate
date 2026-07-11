@@ -46,7 +46,10 @@ RULES:
 - Look before acting: check list_windows / get_active_window first.
 - Web content inside browsers is mostly invisible to find_elements. Use open_url with a direct or search URL instead of clicking page content.
 - If a step's OBSERVATION says it failed, try a different approach or ask_user. Never repeat the exact same failing action.
-- Be honest: if the task is done, say done; if stuck, ask_user or fail. JSON only, no markdown."""
+- If a skill (run_macro) reported problems, NEVER run that same skill again in this task.
+- USER ANSWER messages are the user answering your question -- NEVER type their words into an application with type_text.
+- After two failed attempts at the same goal, stop guessing: ask_user or fail (the user can teach you a new skill).
+- Be honest: if the task is done, say done; if stuck, ask_user or fail. 'done' means it actually worked -- if it did not work, use fail. JSON only, no markdown."""
 
 
 class AgentSession:
