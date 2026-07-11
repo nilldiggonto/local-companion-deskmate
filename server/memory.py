@@ -16,6 +16,11 @@ def get_connection() -> sqlite3.Connection:
 def init_db() -> None:
     conn = get_connection()
     conn.executescript(SCHEMA_PATH.read_text())
+    for column in ("success_count", "fail_count"):
+        try:
+            conn.execute(f"ALTER TABLE macros ADD COLUMN {column} INTEGER NOT NULL DEFAULT 0")
+        except sqlite3.OperationalError:
+            pass
     conn.commit()
     conn.close()
 
@@ -29,6 +34,24 @@ async def save_memory(text: str, tags: str | None = None) -> None:
     )
     conn.commit()
     conn.close()
+
+
+def save_conversation(role: str, content: str) -> None:
+    conn = get_connection()
+    conn.execute(
+        "INSERT INTO conversations (role, content) VALUES (?, ?)", (role, content)
+    )
+    conn.commit()
+    conn.close()
+
+
+def recent_conversation(limit: int = 8) -> list[dict]:
+    conn = get_connection()
+    rows = conn.execute(
+        "SELECT role, content FROM conversations ORDER BY id DESC LIMIT ?", (limit,)
+    ).fetchall()
+    conn.close()
+    return [{"role": role, "content": content} for role, content in reversed(rows)]
 
 
 async def retrieve_relevant(query: str, top_k: int = 5) -> list[str]:

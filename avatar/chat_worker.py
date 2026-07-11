@@ -5,7 +5,7 @@ BASE_URL = "http://127.0.0.1:8000"
 
 
 class ChatWorker(QThread):
-    reply_ready = pyqtSignal(str)
+    reply_ready = pyqtSignal(str, list)
     error = pyqtSignal(str)
 
     def __init__(self, message: str, parent=None):
@@ -19,6 +19,7 @@ class ChatWorker(QThread):
                     f"{BASE_URL}/chat", json={"message": self.message}, timeout=180.0
                 )
                 response.raise_for_status()
-                self.reply_ready.emit(response.json()["reply"])
+                data = response.json()
+                self.reply_ready.emit(data["reply"], data.get("suggestions", []))
         except httpx.HTTPError as exc:
             self.error.emit(str(exc))

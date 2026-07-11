@@ -42,16 +42,23 @@ def main():
 
     def handle_message(text: str):
         bubble.input_field.setEnabled(False)
+        bubble.input_field.setPlaceholderText("Thinking...")
         worker = ChatWorker(text)
         active_workers.append(worker)
 
-        def on_reply(reply: str):
-            bubble.add_message("Bot", reply)
+        def restore_input():
             bubble.input_field.setEnabled(True)
+            bubble.input_field.setPlaceholderText("Type a message...")
+            bubble.input_field.setFocus()
+
+        def on_reply(reply: str, suggestions: list):
+            bubble.add_message("Bot", reply)
+            bubble.set_suggestions(suggestions)
+            restore_input()
 
         def on_error(msg: str):
             bubble.add_message("Bot", f"Error: {msg}")
-            bubble.input_field.setEnabled(True)
+            restore_input()
 
         worker.reply_ready.connect(on_reply)
         worker.error.connect(on_error)
